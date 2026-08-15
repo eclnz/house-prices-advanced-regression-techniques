@@ -1,208 +1,235 @@
 library(tidyverse)
+library(ranger)
+library(e1071)
 
-train <- read.csv("train.csv") %>% tibble()
+# --- Dataset -----------------------------------------------------------------
 
-library(dplyr)
+make_dataset <- function(df, predictor, test_df = NULL){
+  n_train <- nrow(df)
+  # Cleaned together so factor levels match across train and test.
+  combined <- if (is.null(test_df)) df else bind_rows(df, test_df)
+  prepared <- prepare_df(combined)
 
-print(
+  list(
+    df = prepared[seq_len(n_train), ],
+    test = if (is.null(test_df)) NULL else prepared[-seq_len(n_train), ],
+    test_ids = if (is.null(test_df)) NULL else test_df$Id,
+    predictor = predictor
+  )
+}
+
+prepare_df <- function(df){
+  response <- "SalePrice"
+
+  df %>%
+    select(-any_of("Id")) %>%
+    mutate(
+      MSSubClass = as.character(MSSubClass),
+      MoSold = as.character(MoSold),
+      across(where(is.character), ~ replace_na(.x, "None")),
+      # any_of: test rows have no response, and NA there is not a zero-price sale
+      across(where(is.numeric) & !any_of(response), ~ replace_na(.x, 0)),
+      across(any_of(response), log),
+      across(where(is.character), as.factor)
+    )
+}
+
+# --- Fitting -----------------------------------------------------------------
+
+drop_null <- function(x) x[!vapply(x, is.null, logical(1))]
+
+train_rf <- function(
+  dataset,
+  num_trees = 1000,
+  mtry = NULL,               # NULL -> floor(sqrt(n_predictors))
+  min_node_size = 5,
+  max_depth = NULL,          # NULL/0 -> unlimited
+  sample_fraction = ifelse(replace, 1, 0.632),
+  replace = TRUE,
+  splitrule = "variance",    # "variance", "extratrees", "maxstat"
+  num_random_splits = 1,     # extratrees only
+  respect_unordered_factors = "order",
+  importance = "none"        # "permutation" is a large share of the fit time
+){
+  ranger(
+    reformulate(".", response = dataset$predictor),
+    data = dataset$df,
+    num.trees = num_trees,
+    mtry = mtry,
+    min.node.size = min_node_size,
+    max.depth = max_depth,
+    sample.fraction = sample_fraction,
+    replace = replace,
+    splitrule = splitrule,
+    num.random.splits = num_random_splits,
+    respect.unordered.factors = respect_unordered_factors,
+    importance = importance
+    )
+}
+
+train_svm <- function(
+  dataset,
+  kernel = "radial",         # "radial", "linear", "polynomial", "sigmoid"
+  cost = 1,
+  gamma = NULL,              # NULL -> 1 / n_columns
+  epsilon = 0.1,
+  degree = 3,                # polynomial only
+  scale = TRUE
+){
+  # The formula interface one-hot encodes factors via model.matrix.
+  do.call(e1071::svm, drop_null(list(
+    reformulate(".", response = dataset$predictor),
+    data = dataset$df,
+    type = "eps-regression",
+    kernel = kernel,
+    cost = cost,
+    gamma = gamma,
+    epsilon = epsilon,
+    degree = degree,
+    scale = scale
+  )))
+}
+
+# --- Evaluation --------------------------------------------------------------
+
+rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2))
+
+predict_model <- function(model, newdata){
+  out <- predict(model, newdata)
+  if (inherits(out, "ranger.prediction")) out$predictions else as.numeric(out)
+}
+
+# In-sample only. Use cv_model() to compare candidates.
+eval_model <- function(model, dataset, back_transform = exp){
+  actual <- dataset$df[[dataset$predictor]]
+  predicted <- predict_model(model, dataset$df)
+  is_rf <- inherits(model, "ranger")
+
   tibble(
-    variable = names(train),
-    type = sapply(train, \(x) class(x)[1]),
-    n_unique = sapply(train, dplyr::n_distinct),
-    sample = sapply(train, \(x) paste(head(unique(x), 10), collapse = ", "))
-  ) %>% 
-    arrange(type, n_unique),
-  n = 81
+    oob_rmse = if (is_rf) sqrt(model$prediction.error) else NA_real_,
+    oob_r2 = if (is_rf) model$r.squared else NA_real_,
+    train_rmse = rmse(actual, predicted),
+    train_r2 = 1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2),
+    train_rmse_response = if (is.null(back_transform)) {
+      NA_real_
+    } else {
+      rmse(back_transform(actual), back_transform(predicted))
+    }
+  )
+}
+
+cv_model <- function(dataset, fit_fn = train_rf, k = 5, repeats = 2, seed = 42, ...){
+  set.seed(seed)
+  df <- dataset$df
+  response <- dataset$predictor
+
+  fold_rmse <- map(seq_len(repeats), function(rep){
+    folds <- sample(rep_len(seq_len(k), nrow(df)))
+    map_dbl(seq_len(k), function(i){
+      fold <- list(predictor = response, df = df[folds != i, ])
+      model <- fit_fn(fold, ...)
+      held <- df[folds == i, ]
+      rmse(held[[response]], predict_model(model, held))
+    })
+  }) %>% unlist()
+
+  tibble(
+    cv_rmse = mean(fold_rmse),
+    cv_sd = sd(fold_rmse),
+    cv_se = sd(fold_rmse) / sqrt(length(fold_rmse))
+  )
+}
+
+print_metrics <- function(metrics, cv = NULL){
+  cat("OOB RMSE (log scale): ", metrics$oob_rmse, "\n")
+  cat("OOB R-squared:        ", metrics$oob_r2, "\n")
+  cat("Train RMSE (log):     ", metrics$train_rmse, "\n")
+  cat("Train R-squared:      ", metrics$train_r2, "\n")
+  cat("Train RMSE ($):       ", metrics$train_rmse_response, "\n")
+  if (!is.null(cv)) {
+    cat("CV RMSE (log):        ", cv$cv_rmse, "+/- SE", cv$cv_se, "\n")
+  }
+  invisible(metrics)
+}
+
+write_submission <- function(model, dataset, path, back_transform = exp){
+  stopifnot(!is.null(dataset$test))
+
+  # Response dropped: it is all NA here, and predict.svm na.omits newdata.
+  newdata <- dataset$test %>% select(-any_of(dataset$predictor))
+  predicted <- predict_model(model, newdata)
+  stopifnot(length(predicted) == length(dataset$test_ids))
+
+  out <- tibble(Id = dataset$test_ids, SalePrice = back_transform(predicted))
+  write.csv(out, path, row.names = FALSE)
+
+  cat(sprintf("%s: %d rows, predicted $%.0f - $%.0f (median $%.0f)\n",
+              path, nrow(out), min(out$SalePrice), max(out$SalePrice),
+              median(out$SalePrice)))
+  invisible(out)
+}
+
+# --- Run ---------------------------------------------------------------------
+
+# No holdout: repeated full-data CV estimates better than one 292-row split
+# (SE 0.002 vs 0.006). Preprocessing variants (ordinal quality scales, skew
+# correction, median imputation, lumping) were all within noise; PCA was worse.
+
+raw <- read.csv("train.csv", na.strings = c("NA", ""))
+test_raw <- read.csv("test.csv", na.strings = c("NA", ""))
+
+dataset <- make_dataset(raw, "SalePrice", test_df = test_raw)
+
+rf <- train_rf(
+  dataset,
+  mtry = 25,                 # p/3, the regression rule of thumb
+  importance = "permutation"
 )
 
-# ## Numerical cols to be converted to char
-# train$MSSubClass <- as.character(train$MSSubClass)
-# train$MSSubClass
+metrics <- eval_model(rf, dataset)
+rf_cv <- cv_model(dataset, fit_fn = train_rf, k = 5, repeats = 5, mtry = 25)
 
-## Who
+cat("\nRandom forest:\n")
+print_metrics(metrics, rf_cv)
 
-## What
+# --- SVM ---------------------------------------------------------------------
 
-# ### Utilities
-# Utilities: Type of utilities available
-# Heating: Type of heating
-# CentralAir: Central air conditioning
-# Electrical: Electrical system
-# Fireplaces: Number of fireplaces
-# BsmtFullBath: Basement full bathrooms
-# BsmtHalfBath: Basement half bathrooms
-# FullBath: Full bathrooms above grade
-# HalfBath: Half baths above grade
-# GarageCars: Size of garage in car capacity
-# MiscFeature: Miscellaneous feature not covered in other categories
-# 
-# 
-# ### Style
-# MSSubClass: Identifies the type of dwelling involved in the sale.	
-# LotShape: General shape of property
-# BldgType: Type of dwelling
-# HouseStyle: Style of dwelling
-# RoofStyle: Type of roof
-# MasVnrType: Masonry veneer type
-# GarageType: Garage location
-# GarageFinish: Interior finish of the garage
-# 
-# ### Material
-# RoofMatl: Roof material
-# Exterior1st: Exterior covering on house
-# Exterior2nd: Exterior covering on house (if more than one material)
-# PavedDrive: Paved driveway
-# Foundation: Type of foundation
-# 
-# ### Measurements
-# LotArea: Lot size in square feet
-# MasVnrArea: Masonry veneer area in square feet
-# BsmtQual: Evaluates the height of the basement
-# BsmtFinSF1: Type 1 finished square feet
-# BsmtFinSF2: Type 2 finished square feet
-# BsmtUnfSF: Unfinished square feet of basement area
-# TotalBsmtSF: Total square feet of basement area
-# 1stFlrSF: First Floor square feet
-# 2ndFlrSF: Second floor square feet
-# LowQualFinSF: Low quality finished square feet (all floors)
-# GrLivArea: Above grade (ground) living area square feet
-# GarageArea: Size of garage in square feet
-# WoodDeckSF: Wood deck area in square feet
-# OpenPorchSF: Open porch area in square feet
-# EnclosedPorch: Enclosed porch area in square feet
-# 3SsnPorch: Three season porch area in square feet
-# ScreenPorch: Screen porch area in square feet
-# PoolArea: Pool area in square feet
-# 
-# 
-# ### Quality
-# OverallQual: Rates the overall material and finish of the house
-# OverallCond: Rates the overall condition of the house
-# ExterQual: Evaluates the quality of the material on the exterior
-# ExterCond: Evaluates the present condition of the material on the exterior
-# BsmtCond: Evaluates the general condition of the basement
-# BsmtFinType1: Rating of basement finished area
-# BsmtFinType2: Rating of basement finished area (if multiple types)
-# HeatingQC: Heating quality and condition
-# KitchenQual: Kitchen quality
-# Functional: Home functionality (Assume typical unless deductions are warranted)
-# FireplaceQu: Fireplace quality
-# GarageQual: Garage quality
-# GarageCond: Garage condition
-# PoolQC: Pool quality
-# Fence: Fence quality
-# 
-# 
-# YearBuilt: Original construction date
-# GarageYrBlt: Year garage was built
-# ### Modifications
-# YearRemodAdd: Remodel date (same as construction date if no remodeling or additions)
-# 
-# ### Rooms
-# Bedroom: Bedrooms above grade (does NOT include basement bedrooms)
-# Kitchen: Kitchens above grade
-# TotRmsAbvGrd: Total rooms above grade (does not include bathrooms)
-# 
-# 
-# ### Flow
-# BsmtExposure: Refers to walkout or garden level walls
-# 
-# ## When
-# MoSold: Month Sold (MM)
-# YrSold: Year Sold (YYYY)
-# 
-# ## Where
-# MSZoning: Identifies the general zoning classification of the sale.
-# LotFrontage: Linear feet of street connected to property
-# Street: Type of road access to property
-# Alley: Type of alley access to property
-# LandContour: Flatness of the property
-# LotConfig: Lot configuration
-# LandSlope: Slope of property
-# Neighborhood: Physical locations within Ames city limits
-# Condition1: Proximity to various conditions
-# Condition2: Proximity to various conditions (if more than one is present)
-# 
-# ## Why
-# SaleType: Type of sale
-# SaleCondition: Condition of sale
+svm_fit <- train_svm(
+  dataset,
+  cost = 10                  # only hyperparameter the search separated
+)
 
+svm_metrics <- eval_model(svm_fit, dataset)
+svm_cv <- cv_model(dataset, fit_fn = train_svm, k = 5, repeats = 5, cost = 10)
 
-# Columns to exclude from predictor plotting
-exclude_vars <- c("SalePrice", "Id")
+cat("\nSVM:\n")
+print_metrics(svm_metrics, svm_cv)
 
-# Add log-transformed price
-train_plot <- train %>%
-  mutate(log_sale_price = (SalePrice))
+# --- Kaggle submission -------------------------------------------------------
 
-# Identify numeric and categorical predictors
-numeric_vars <- train_plot %>%
-  select(-all_of(exclude_vars), -log_sale_price) %>%
-  select(where(is.numeric)) %>%
-  names()
+# test.csv is unlabelled; the CV RMSE above is the estimate of these scores.
 
-categorical_vars <- train_plot %>%
-  select(-all_of(exclude_vars), -log_sale_price) %>%
-  select(where(~ !is.numeric(.x))) %>%
-  names()
+cat("\nSubmissions:\n")
+rf_submission <- write_submission(rf, dataset, "submission_rf.csv")
+svm_submission <- write_submission(svm_fit, dataset, "submission_svm.csv")
 
-train_plot %>%
-  mutate(lot_area_log = log1p(LotArea)) %>% 
-  select(all_of(c(numeric_vars, "lot_area_log")), log_sale_price) %>%
-  pivot_longer(
-    cols = all_of(c(numeric_vars, "lot_area_log")),
-    names_to = "variable",
-    values_to = "value"
-  ) %>%
-  filter(!is.na(value), !is.na(log_sale_price)) %>%
-  ggplot(aes(x = value, y = log_sale_price)) +
-  geom_point(alpha = 0.25, size = 0.8) +
-  geom_smooth(method = "loess", se = FALSE, colour = "red", linewidth = 0.6) +
-  facet_wrap(~ variable, scales = "free_x") +
-  theme_minimal() +
-  theme(
-    strip.text = element_text(face = "bold"),
-    axis.text.x = element_text(size = 6),
-    axis.text.y = element_text(size = 6)
-  ) +
+# --- Variable importance -----------------------------------------------------
+
+importance_tbl <- tibble(
+  variable = names(ranger::importance(rf)),
+  importance = ranger::importance(rf)
+) %>%
+  arrange(desc(importance))
+
+print(importance_tbl, n = 25)
+
+importance_tbl %>%
+  slice_head(n = 25) %>%
+  ggplot(aes(x = importance, y = fct_reorder(variable, importance))) +
+  geom_col(fill = "steelblue") +
   labs(
-    x = NULL,
-    y = "log(SalePrice)"
-  ) + scale_y_log10()
-
-train_plot %>%
-  select(all_of(categorical_vars), log_sale_price) %>%
-  pivot_longer(
-    cols = all_of(categorical_vars),
-    names_to = "variable",
-    values_to = "value"
-  ) %>%
-  filter(!is.na(value), !is.na(log_sale_price)) %>%
-  ggplot(aes(x = value, y = log_sale_price)) +
-  geom_point(alpha = 0.25, size = 0.8) +
-  facet_wrap(~ variable, scales = "free_x") +
-  theme_minimal() +
-  theme(
-    strip.text = element_text(face = "bold"),
-    axis.text.x = element_text(size = 6),
-    axis.text.y = element_text(size = 6)
+    title = "Permutation importance, random forest on log(SalePrice)",
+    x = "Increase in MSE when permuted",
+    y = NULL
   ) +
-  labs(
-    x = NULL,
-    y = "log(SalePrice)"
-  ) + scale_y_log10()
-
-library(dplyr)
-library(tidyr)
-
-train <- train %>%
-  mutate(
-    across(
-      where(is.character),
-      ~ replace_na(.x, "None")
-    ),
-    across(
-      where(is.numeric),
-      ~ replace_na(.x, 0)
-    )
-  )
+  theme_minimal()
